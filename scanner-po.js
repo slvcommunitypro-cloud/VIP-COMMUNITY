@@ -67,14 +67,15 @@
 
   function isPocketHistory(rows, source) {
     var src = String(source || '');
-    if (/fallback|synth|yahoo|market/i.test(src)) return false;
     if (!rows || rows.length < 8) return false;
+    if (/pocketoption/i.test(src)) return true;
+    if (/fallback|synth|yahoo|market/i.test(src)) return false;
     var ranged = 0;
     rows.forEach(function (c) {
       var scale = Math.abs(c.close) || 1;
-      if ((c.high - c.low) > scale * 0.00004) ranged += 1;
+      if ((c.high - c.low) > scale * 0.000008) ranged += 1;
     });
-    return ranged / rows.length >= 0.5;
+    return ranged / rows.length >= 0.25;
   }
 
   function sma(arr, n) {
@@ -149,7 +150,7 @@
     var ms = Math.max(1, Number(tf) || 1) * 60000;
     var bucket = Math.floor(Date.now() / ms);
     var key = String(pair || '') + ':' + String(tf || 1) + ':' + bucket;
-    if (!presentSignal.hold || presentSignal.hold.key !== key || (presentSignal.hold.analysis.wait && !analysis.wait)) {
+    if (!presentSignal.hold || presentSignal.hold.key !== key) {
       presentSignal.hold = { key: key, analysis: analysis };
     }
     var fixed = presentSignal.hold.analysis;
@@ -167,14 +168,28 @@
       score: fixed.score,
       pattern: fixed.pattern,
       fib: fixed.fib,
+      zone: fixed.zone || '',
       pointsText: fixed.pointsText,
       reasons: fixed.reasons,
-      closes: fixed.closes
+      closes: fixed.closes,
+      up: fixed.up,
+      down: fixed.down,
+      confidence: fixed.confidence,
+      indicators: fixed.indicators,
+      factors: fixed.factors,
+      reclaimSide: fixed.reclaimSide || '',
+      lastBar: analysis.lastBar || fixed.lastBar,
+      quoteAt: fixed.quoteAt || 0,
+      receivedAt: fixed.receivedAt || 0,
+      signalAt: fixed.signalAt || 0,
+      latencyMs: fixed.latencyMs || 0,
+      dataAge: fixed.dataAge,
+      marketState: fixed.marketState || ''
     };
   }
 
-  function analyzeMarket(candles, ticks) {
-    var series = sanitizeCandles(candles).slice(-160);
+  function analyzeMarket(candles, ticks, higher, frames, meta) {
+    var series = sanitizeCandles(candles).slice(-400);
     if (!series.length) {
       return { wait: true, isUp: false, last: 0, entry: 0, accuracy: 50, rsi: 50, sma9: 0, sma20: 0, vol: 0, reasons: ['Нет котировок'], levels: { support: 0, resistance: 0 }, pattern: { name: '', bias: 0 } };
     }
@@ -197,25 +212,60 @@
     if (lastClosed.close <= levels.support + range * 0.16 && pattern.bias >= 0) score += 2;
     if (lastClosed.close >= levels.resistance - range * 0.16 && pattern.bias <= 0) score -= 2;
     var settled = settledBars(series);
-    var fib = fibRetracement(settled);
-    var fibCall = minuteCall(fib, settled, ticks);
+    var decided = settled.length >= 4 ? settled : series;
+    var fib = fibRetracement((decided.length ? decided : series).slice(-160));
+    var fibCall = minuteCall(fib, (decided.length ? decided : series).slice(-160), ticks);
+    var higherRows = higher ? settledBars(sanitizeCandles(higher).slice(-400)) : null;
+    var board = null;
+    if (window.SignalEngine && window.SignalEngine.decide) {
+      var agg = window.SignalEngine.aggregate;
+      var tickAt = 0;
+      (ticks || []).forEach(function (tick) {
+        var stamp = Number(tick && (tick.t || tick[0]) || 0);
+        if (stamp > 10000000000 && stamp > tickAt) tickAt = stamp;
+      });
+      board = window.SignalEngine.decide({
+        pair: frames && frames.pair,
+        m1: decided,
+        m3: agg ? agg(decided, 180000) : [],
+        m5: (frames && frames['5м']) || higherRows || [],
+        m15: (frames && frames['15м']) || [],
+        now: Date.now(),
+        lastTickAt: (meta && meta.quoteAt) || tickAt || (series.length ? series[series.length - 1].t : 0),
+        ticks: ticks || []
+      });
+    }
     var wait = false;
     var drift = lastClosed.close - (use.length > 3 ? use[use.length - 4].close : lastClosed.open);
-    var isUp = fibCall ? fibCall.isUp : drift >= 0;
-    var accuracy = fibCall ? fibCall.accuracy : 56;
+    var isUp = fibCall ? !!fibCall.isUp : drift >= 0;
+    var accuracy = fibCall ? fibCall.accuracy : 64;
+    var zoneName = fibCall && fibCall.zone === 'LOW' ? 'низ' : (fibCall && fibCall.zone === 'HIGH' ? 'верх' : (fibCall && fibCall.zone === 'MID' ? 'середина' : 'ход'));
     var reason = fibCall ? fibCall.reason : (isUp
-      ? 'Последние закрытые минуты вверх. CALL на открытии следующей минуты.'
-      : 'Последние закрытые минуты вниз. PUT на открытии следующей минуты.');
+      ? 'Фибоначчи: коррекция вверх. CALL на открытии следующей минуты.'
+      : 'Фибоначчи: коррекция вниз. PUT на открытии следующей минуты.');
     var slice = use.slice(-20);
     var vol = 0;
     slice.forEach(function (c) { vol += (c.high - c.low) / (c.close || 1); });
     vol = slice.length ? (vol / slice.length) * 100 : 0;
     return {
       isUp: isUp, wait: wait, last: last, entry: last, sma9: sma9, sma20: sma20, rsi: r, vol: vol,
-      levels: levels, accuracy: accuracy, score: score, pattern: pattern, fib: fib,
+      levels: levels, accuracy: accuracy, score: accuracy, pattern: pattern, fib: fib,
+      zone: fibCall ? fibCall.zone : '',
       pointsText: fibCall && fibCall.tape ? fibCall.tape.pointsText : '',
-      reasons: [reason, pattern.name + ' · RSI ' + r.toFixed(1)],
-      closes: series.slice(-12).map(function (c) { return Number(c.close); })
+      up: isUp ? 7 : 3,
+      down: isUp ? 3 : 7,
+      confidence: accuracy,
+      indicators: board ? board.indicators : null,
+      factors: null,
+      reclaimSide: isUp ? 'UP' : 'DOWN',
+      reasons: [reason, 'Зона Фибоначчи: ' + zoneName + '.', pattern.name ? (pattern.name + ' · RSI ' + r.toFixed(1)) : ('RSI ' + r.toFixed(1))],
+      closes: series.slice(-12).map(function (c) { return Number(c.close); }),
+      lastBar: series.length ? series[series.length - 1] : null,
+      quoteAt: meta && meta.quoteAt || 0,
+      receivedAt: meta && meta.receivedAt || 0,
+      signalAt: Date.now(),
+      latencyMs: meta && meta.quoteAt ? Math.max(0, Date.now() - meta.quoteAt) : 0,
+      marketState: zoneName === 'низ' ? 'ФИБО НИЗ' : (zoneName === 'верх' ? 'ФИБО ВЕРХ' : (zoneName === 'середина' ? 'ФИБО СЕРЕДИНА' : 'ФИБО'))
     };
   }
 
@@ -492,8 +542,8 @@
     return poLink.ok;
   }
 
-  async function fetchPocketCandles(pairName, tf) {
-    var period = Math.max(60, Number(tf || 1) * 60);
+  async function fetchPocketCandles(pairName, tf, periodSeconds) {
+    var period = periodSeconds || Math.max(60, Number(tf || 1) * 60);
     var pocketLive = await pocketConnected();
     var res = await fetch(apiBase() + '/api/candles?pair=' + encodeURIComponent(pairName) + '&period=' + period, { cache: 'no-store' });
     if (!res.ok) throw new Error('candles ' + res.status);
@@ -514,8 +564,56 @@
         return list;
       })(),
       ticks: Array.isArray(data.ticks) ? data.ticks : [],
+      quoteAt: Number(data.quoteAt) || 0,
+      receivedAt: Number(data.receivedAt) || 0,
       source: /pocketoption-demo/i.test(data.source || '') ? 'pocketoption-demo' : ((data.source && /pocketoption-api/i.test(data.source)) ? data.source : (pocketLive ? 'pocketoption-api' : (data.source || 'fallback-market')))
     };
+  }
+
+  async function cachedCandles(pairName, seconds, ttl) {
+    if (!cachedCandles.box) cachedCandles.box = {};
+    var key = String(pairName || '') + ':' + seconds;
+    var hit = cachedCandles.box[key];
+    if (hit && Date.now() - hit.at < ttl && hit.candles) return hit.candles;
+    try {
+      var pack = await fetchPocketCandles(pairName, 1, seconds);
+      cachedCandles.box[key] = { at: Date.now(), candles: pack.candles };
+      return pack.candles;
+    } catch (e) {
+      return hit ? hit.candles : null;
+    }
+  }
+
+  function buildFrames(s5, m1, m15) {
+    var agg = window.VipMarket && window.VipMarket.aggregateCandles;
+    var frames = {};
+    if (!agg) return frames;
+    if (s5 && s5.length) {
+      frames['5с'] = s5;
+      frames['15с'] = agg(s5, 15000);
+      frames['30с'] = agg(s5, 30000);
+    }
+    if (m1 && m1.length) {
+      frames['1м'] = m1;
+      frames['5м'] = agg(m1, 300000);
+      frames['10м'] = agg(m1, 600000);
+      if (!m15) frames['15м'] = agg(m1, 900000);
+    }
+    if (m15 && m15.length) frames['15м'] = m15;
+    return frames;
+  }
+
+  async function loadScan(pairName, tf) {
+    var pack = await fetchPocketCandles(pairName, tf);
+    var s5 = null;
+    var m15 = null;
+    if (Number(tf) === 1) {
+      s5 = await cachedCandles(pairName, 5, 15000);
+      m15 = await cachedCandles(pairName, 900, 180000);
+    }
+    var frames = buildFrames(s5, pack.candles, m15);
+    frames.pair = pairName;
+    return { pack: pack, m5: frames['5м'] || null, frames: frames };
   }
 
   function unlockScanScroll(overlay) {
@@ -581,57 +679,141 @@
     scanExpiryTimer = setInterval(tick, 250);
   }
 
+  function readJournal() {
+    try { return JSON.parse(localStorage.getItem('vip_signal_log') || '[]'); }
+    catch (e) { return []; }
+  }
+
+  function writeJournal(rows) {
+    try { localStorage.setItem('vip_signal_log', JSON.stringify((rows || []).slice(-500))); }
+    catch (e) {}
+  }
+
+  function postJournal(row) {
+    var base = apiBase();
+    if (!base || !row) return;
+    fetch(base + '/api/signals', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(row)
+    }).catch(function () {});
+  }
+
+  function rememberSignal(pair, tf, analysis) {
+    if (!analysis) return;
+    var signalTimestamp = Number(analysis.quoteAt || Date.now());
+    var expirationTimestamp = signalTimestamp + 60000;
+    var id = String(pair || '') + ':' + tf + ':' + signalTimestamp;
+    var log = readJournal();
+    if (log.some(function (row) { return row.id === id; })) return;
+    var row = {
+      id: id,
+      at: Date.now(),
+      signalTimestamp: signalTimestamp,
+      pair: pair,
+      tf: Number(tf) || 1,
+      entryAt: signalTimestamp,
+      expiryAt: expirationTimestamp,
+      expirationTimestamp: expirationTimestamp,
+      receivedAt: analysis.receivedAt || 0,
+      signalAt: analysis.signalAt || Date.now(),
+      latencyMs: analysis.latencyMs || 0,
+      signal: analysis.isUp ? 'UP' : 'DOWN',
+      marketState: analysis.marketState || '',
+      score: analysis.score,
+      dataAge: analysis.dataAge,
+      entry: analysis.wait ? null : (analysis.entry || analysis.last || null),
+      close: null,
+      result: null,
+      up: analysis.up,
+      down: analysis.down,
+      indicators: analysis.indicators || null,
+      reason: analysis.reason || ''
+    };
+    log.push(row);
+    writeJournal(log);
+    postJournal(row);
+  }
+
+  function gradeJournal(candles, ticks) {
+    if (!window.SignalEngine || !window.SignalEngine.resolveOutcome) return;
+    var log = readJournal();
+    var changed = false;
+    log.forEach(function (row) {
+      if (!row || row.signal === 'NO_TRADE') return;
+      var before = row.result;
+      var keptEntry = row.entry;
+      window.SignalEngine.resolveOutcome(row, { ticks: ticks || [], candles: candles, now: Date.now() });
+      if (keptEntry > 0) row.entry = keptEntry;
+      if (row.result && row.result !== before) {
+        changed = true;
+        postJournal(row);
+      }
+    });
+    if (changed) writeJournal(log);
+  }
+
+  function journalLine() {
+    var done = readJournal().filter(function (row) { return row.result === 'WIN' || row.result === 'LOSS'; });
+    if (!done.length) return '';
+    var wins = done.filter(function (row) { return row.result === 'WIN'; }).length;
+    return 'Журнал: ' + done.length + ' закрытых сигналов, ' + wins + ' свеча закрылась в сторону сигнала.';
+  }
+
   function paintVerdict(pair, tfLabel, analysis) {
     var d = digitsFor(analysis.entry || analysis.last || 0);
     var entry = (analysis.entry || analysis.last || 0).toFixed(d);
     var title = $('analyzed-pair-title');
     if (title) title.textContent = pair + '  •  ' + tfLabel;
     var label = $('ta-summary-tf-label');
-    if (label) label.textContent = 'Фибоначчи (' + tfLabel + ') · ' + (analysis.pattern.name || 'PO');
+    if (label) label.textContent = (analysis.marketState || 'РЫНОК') + ' · ' + tfLabel;
+    var ind = analysis.indicators || {};
     var rsiEl = $('ta-rsi-val');
-    if (rsiEl) rsiEl.textContent = Number(analysis.rsi || 0).toFixed(1);
+    if (rsiEl) rsiEl.textContent = Number(ind.rsi != null ? ind.rsi : analysis.rsi || 0).toFixed(1);
     var s9 = $('ta-sma9-val');
-    if (s9) s9.textContent = Number(analysis.sma9 || 0).toFixed(d);
+    if (s9) s9.textContent = Number(ind.ema20 != null ? ind.ema20 : analysis.sma9 || 0).toFixed(d);
     var s20 = $('ta-sma20-val');
-    if (s20) s20.textContent = Number(analysis.sma20 || 0).toFixed(d);
+    if (s20) s20.textContent = Number(ind.ema50 != null ? ind.ema50 : analysis.sma20 || 0).toFixed(d);
     var vol = $('ta-vol-val');
-    if (vol) vol.textContent = Number(analysis.vol || 0).toFixed(2) + '%';
+    if (vol) vol.textContent = ind.adx != null ? Number(ind.adx).toFixed(1) : Number(analysis.vol || 0).toFixed(2) + '%';
     var arrow = $('final-direction-arrow');
     var fill = $('final-progress-fill');
     var acc = $('final-accuracy-percent');
     var verdict = $('ta-verdict-box');
-    if (acc) acc.textContent = analysis.accuracy + '%';
-    if (fill) fill.style.width = analysis.accuracy + '%';
+    if (acc) acc.textContent = (analysis.score != null ? analysis.score : analysis.accuracy) + '/100';
+    if (fill) fill.style.width = Math.max(0, Math.min(100, analysis.score != null ? analysis.score : analysis.accuracy)) + '%';
     if (analysis.wait) {
-      if (arrow) { arrow.textContent = 'ЖДАТЬ M' + scanTf; arrow.className = 'final-dir'; arrow.style.color = '#3d8bff'; }
-      if (fill) { fill.style.background = '#3d8bff'; fill.style.boxShadow = '0 0 20px #3d8bff'; }
-      if (verdict) { verdict.textContent = 'ЖДАТЬ ЗАКРЫТИЕ · ' + (analysis.reasons[0] || ''); verdict.className = 'ta-verdict'; }
+      if (arrow) { arrow.textContent = 'CALL ↑'; arrow.className = 'final-dir up'; arrow.style.color = ''; }
+      if (fill) { fill.style.background = 'var(--neon-green)'; fill.style.boxShadow = '0 0 20px var(--neon-green)'; }
+      if (verdict) { verdict.textContent = 'CALL · ' + (analysis.reason || 'коррекция по Фибоначчи'); verdict.className = 'ta-verdict buy'; }
     } else if (analysis.isUp) {
       if (arrow) { arrow.textContent = 'CALL ↑ СЛЕДУЮЩАЯ M' + scanTf; arrow.className = 'final-dir up'; arrow.style.color = ''; }
       if (fill) { fill.style.background = 'var(--neon-green)'; fill.style.boxShadow = '0 0 20px var(--neon-green)'; }
-      if (verdict) { verdict.textContent = 'CALL · Фибо · вход от ' + entry + ' · ' + tfLabel; verdict.className = 'ta-verdict buy'; }
+      if (verdict) { verdict.textContent = 'CALL · вверх ' + (analysis.up == null ? '' : analysis.up + '/10 · ') + 'вход от ' + entry + ' · ' + tfLabel; verdict.className = 'ta-verdict buy'; }
     } else {
       if (arrow) { arrow.textContent = 'PUT ↓ СЛЕДУЮЩАЯ M' + scanTf; arrow.className = 'final-dir down'; arrow.style.color = ''; }
       if (fill) { fill.style.background = 'var(--neon-red)'; fill.style.boxShadow = '0 0 20px var(--neon-red)'; }
-      if (verdict) { verdict.textContent = 'PUT · Фибо · вход от ' + entry + ' · ' + tfLabel; verdict.className = 'ta-verdict sell'; }
+      if (verdict) { verdict.textContent = 'PUT · вниз ' + (analysis.down == null ? '' : analysis.down + '/10 · ') + 'вход от ' + entry + ' · ' + tfLabel; verdict.className = 'ta-verdict sell'; }
     }
     var banner = $('scan-pattern-banner');
     if (banner) {
-      var extra = (window.__slvForecast && window.__slvForecast.pair === pair) ? window.__slvForecast.text : '';
-      banner.innerHTML = (analysis.reasons || []).join('<br>') + (extra ? '<br><br>' + extra : '');
+      var journal = journalLine();
+      var barLine = lastBarLine(analysis.lastBar);
+      var lag = analysis.latencyMs != null ? ('SIGNAL LATENCY: ' + analysis.latencyMs + ' ms') : '';
+      banner.innerHTML = (barLine ? barLine + '<br>' : '') + (lag ? lag + '<br>' : '') + (analysis.reasons || []).join('<br>') + (journal ? '<br>' + journal : '');
     }
     var call = $('scan-call-side');
     var put = $('scan-put-side');
     if (call && put) {
-      call.classList.toggle('active-call', !analysis.wait && analysis.isUp);
+      call.classList.toggle('active-call', analysis.wait || analysis.isUp);
       put.classList.toggle('active-put', !analysis.wait && !analysis.isUp);
-      call.style.opacity = analysis.wait ? '0.55' : (analysis.isUp ? '1' : '0.45');
-      put.style.opacity = analysis.wait ? '0.55' : (!analysis.isUp ? '1' : '0.45');
+      call.style.opacity = analysis.wait || analysis.isUp ? '1' : '0.45';
+      put.style.opacity = !analysis.wait && !analysis.isUp ? '1' : '0.45';
     }
     var price = $('scanning-live-price');
     if (price && analysis.last) {
       price.textContent = analysis.last.toFixed(digitsFor(analysis.last));
-      price.className = 'po-price ' + (analysis.wait ? 'neutral' : (analysis.isUp ? '' : 'down'));
+      price.className = 'po-price ' + (analysis.isUp || analysis.wait ? '' : 'down');
     }
     window.__slvChatContext = {
       pair: pair,
@@ -639,35 +821,30 @@
       reason: (analysis.reasons && analysis.reasons[0]) || '',
       rsi: analysis.rsi,
       closes: analysis.closes || [],
-      direction: analysis.wait ? 'WAIT' : (analysis.isUp ? 'CALL' : 'PUT'),
+      direction: analysis.isUp || analysis.wait ? 'CALL' : 'PUT',
       level: analysis.fib ? analysis.fib.nearest : null,
-      points: analysis.pointsText || ''
+      points: analysis.pointsText || '',
+      up: analysis.up,
+      down: analysis.down,
+      modelStrength: analysis.confidence
     };
   }
 
   var forecastToken = 0;
-  function askScannerForecast(pair, analysis) {
-    if (!analysis || analysis.wait) return;
-    var token = ++forecastToken;
-    var banner = $('scan-pattern-banner');
-    if (banner) banner.innerHTML = (analysis.reasons || []).join('<br>') + '<br><span style="color:#9aa8b8;">Считаю прогноз на следующую минуту…</span>';
-    var base = apiBase();
-    fetch(base + '/api/ai-chat', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        mode: 'forecast',
-        messages: [{ role: 'user', content: 'Прогноз на следующую минуту по ' + pair }],
-        context: window.__slvChatContext || {}
-      })
-    }).then(function (res) { return res.json(); }).then(function (data) {
-      if (token !== forecastToken) return;
-      var text = (data && (data.answer || data.error)) || '';
-      if (!text) return;
-      window.__slvForecast = { pair: pair, text: String(text).replace(/\n/g, '<br>') };
-      if (!banner) return;
-      banner.innerHTML = (analysis.reasons || []).join('<br>') + '<br><br>' + window.__slvForecast.text;
-    }).catch(function () {});
+  function lastBarLine(bar) {
+    if (!bar || !(bar.close > 0)) return '';
+    var stamp = '';
+    if (bar.t) {
+      try {
+        stamp = new Date(bar.t).toLocaleTimeString('ru-RU', { timeZone: 'Europe/Moscow', hour: '2-digit', minute: '2-digit' });
+      } catch (e) { stamp = ''; }
+    }
+    var d = digitsFor(bar.close);
+    return 'Свеча M1 ' + (stamp ? stamp + ' МСК' : '') + ' O ' + bar.open.toFixed(d) + ' H ' + bar.high.toFixed(d) + ' L ' + bar.low.toFixed(d) + ' C ' + bar.close.toFixed(d) + '. RSI считается по этим же свечам.';
+  }
+
+  function askScannerForecast() {
+    window.__slvForecast = null;
   }
 
   function stopScanTimers() {
@@ -739,11 +916,15 @@
       setScanOverlay(true, 'Считываю график ' + pairName + ' как на Pocket Option…');
       startNextCandleClock(tf);
       try {
-        var pack = await fetchPocketCandles(pairName, tf);
+        var loaded = await loadScan(pairName, tf);
+        var pack = loaded.pack;
         var fromPocket = isPocketHistory(pack.candles, pack.source);
-        var raw = analyzeMarket(pack.candles, pack.ticks);
-        if (!fromPocket) raw.wait = true;
+        var raw = analyzeMarket(pack.candles, pack.ticks, loaded.m5, loaded.frames, { quoteAt: pack.quoteAt, receivedAt: pack.receivedAt });
         var analysis = presentSignal(pairName, tf, raw);
+        if (fromPocket) {
+          gradeJournal(pack.candles, pack.ticks);
+          rememberSignal(pairName, tf, analysis);
+        }
         drawPocketChart(pack.candles, analysis);
         setTimeout(function () {
           setScanOverlay(false);
@@ -759,11 +940,15 @@
         }, 1600);
         scanPriceTimer = setInterval(async function () {
           try {
-            var fresh = await fetchPocketCandles(pairName, tf);
+            var freshLoad = await loadScan(pairName, tf);
+            var fresh = freshLoad.pack;
             var liveOk = isPocketHistory(fresh.candles, fresh.source);
-            var rawLive = analyzeMarket(fresh.candles, fresh.ticks);
-            if (!liveOk) rawLive.wait = true;
+            var rawLive = analyzeMarket(fresh.candles, fresh.ticks, freshLoad.m5, freshLoad.frames, { quoteAt: fresh.quoteAt, receivedAt: fresh.receivedAt });
             var live = presentSignal(pairName, tf, rawLive);
+            if (liveOk) {
+              gradeJournal(fresh.candles, fresh.ticks);
+              rememberSignal(pairName, tf, live);
+            }
             drawPocketChart(fresh.candles, live);
             paintVerdict(pairName, tfLabel, live);
             if (statusText) statusText.textContent = liveOk ? ('POCKET OPTION • ' + tfLabel) : 'НЕТ СЕССИИ POCKET OPTION';

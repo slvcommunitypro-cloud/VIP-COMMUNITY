@@ -3,7 +3,10 @@ const cors = require('cors');
 const Parser = require('rss-parser');
 const { Telegraf, Markup } = require('telegraf');
 const { createClient } = require('@supabase/supabase-js');
+const fs = require('fs');
+const path = require('path');
 const poDemo = require('./po-demo');
+const signalLogPath = path.join(__dirname, 'signal-log.json');
 
 // ==================== КОНФИГ (лучше всего хранить в .env) ====================
 const PORT = process.env.PORT || 3000;
@@ -587,6 +590,58 @@ app.get('/api/payouts', async function (req, res) {
     return res.json(currentPayouts);
 });
 
+function readSignalLog() {
+    try {
+        const parsed = JSON.parse(fs.readFileSync(signalLogPath, 'utf8'));
+        return Array.isArray(parsed) ? parsed : [];
+    } catch (e) {
+        return [];
+    }
+}
+
+app.get('/api/signals', function (req, res) {
+    const pair = String(req.query.pair || '');
+    const rows = readSignalLog().filter(function (row) { return !pair || row.pair === pair; });
+    res.json({ ok: true, signals: rows.slice(-200) });
+});
+
+app.post('/api/signals', function (req, res) {
+    const row = req.body || {};
+    if (!row.id || (row.signal !== 'UP' && row.signal !== 'DOWN' && row.signal !== 'NO_TRADE')) {
+        return res.status(400).json({ ok: false, error: 'Нужны id и сигнал UP, DOWN или NO_TRADE' });
+    }
+    const list = readSignalLog();
+    const keep = {
+        id: String(row.id).slice(0, 120),
+        at: Number(row.at) || Date.now(),
+        pair: String(row.pair || '').slice(0, 40),
+        tf: Number(row.tf) || 1,
+        entryAt: Number(row.entryAt) || null,
+        expiryAt: Number(row.expiryAt) || null,
+        signal: row.signal,
+        marketState: String(row.marketState || '').slice(0, 32),
+        score: row.score == null ? null : Number(row.score),
+        dataAge: row.dataAge == null ? null : Number(row.dataAge),
+        reason: String(row.reason || '').slice(0, 400),
+        entry: row.entry == null ? null : Number(row.entry),
+        close: row.close == null ? null : Number(row.close),
+        result: row.result === 'WIN' || row.result === 'LOSS' || row.result === 'PUSH' ? row.result : null,
+        up: Number(row.up) || 0,
+        down: Number(row.down) || 0,
+        indicators: row.indicators && typeof row.indicators === 'object' ? row.indicators : null
+    };
+    const idx = list.findIndex(function (item) { return item.id === keep.id; });
+    if (idx >= 0) list[idx] = Object.assign(list[idx], keep);
+    else list.push(keep);
+    const trimmed = list.slice(-5000);
+    fs.writeFile(signalLogPath, JSON.stringify(trimmed), function () {});
+    res.json({ ok: true, count: trimmed.length });
+});
+
+app.get('/api/po/health', function (req, res) {
+    res.json({ ok: true, connected: true, source: 'pocketoption-demo' });
+});
+
 app.get('/api/candles', async function (req, res) {
     const pair = req.query.pair || req.query.symbol || 'EURUSD_otc';
     const period = req.query.period || '60';
@@ -625,15 +680,17 @@ app.post('/api/ai-chat', async function (req, res) {
     const system = forecast
         ? [
             'Дай прогноз только на следующую минутную свечу. Не оценивай текущую незакрытую минуту.',
-            'Первая строка обязана совпасть с полем direction: CALL или PUT. Не меняй сторону.',
-            'Если direction равен WAIT, первая строка: ЖДАТЬ.',
+            'Первая строка обязана совпасть с полем direction: CALL или PUT. Не меняй сторону и не пиши, что сигнала нет.',
             'Вторая строка: вход на открытии следующей минуты, экспирация на её закрытии.',
-            'Дальше одно короткое пояснение: от какого уровня Фибоначчи вход и что показали тики и пункты. Не перечисляй RSI и скользящие.',
-            'Не обещай прибыль и не называй процент уверенности.',
+            'Дальше одно короткое пояснение: зона Фибоначчи (низ — коррекция вверх, верх — коррекция вниз, середина — коррекция против импульса). Если четыре зелёные свечи подряд — продление вверх. Если четыре красные — продление вниз.',
+            'Не обещай прибыль. Всегда выбирай CALL или PUT.',
             'Данные: ' + JSON.stringify({
                 pair: ctx.pair || '',
                 price: ctx.price || null,
                 direction: ctx.direction || '',
+                up: ctx.up == null ? null : ctx.up,
+                down: ctx.down == null ? null : ctx.down,
+                modelStrength: ctx.modelStrength == null ? null : ctx.modelStrength,
                 level: ctx.level != null ? ctx.level : null,
                 points: ctx.points || '',
                 note: ctx.reason || '',

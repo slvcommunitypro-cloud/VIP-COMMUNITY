@@ -203,15 +203,19 @@ class DemoFeed {
     const job = this.pending;
     this.pending = null;
     clearTimeout(this.timer);
-    const candles = asCandles(data.candles).slice(-180);
+    const candles = asCandles(data.candles).slice(-400);
+    const ticks = asTicks(data.history);
     const last = applyLiveTick(candles, data.history);
+    const quoteAt = ticks.length ? ticks[ticks.length - 1].t : (candles.length ? Number(candles[candles.length - 1].t) + 60000 : Date.now());
     job.resolve({
       symbol: data.asset || job.symbol,
       requested: job.pair,
       period: Number(data.period || job.period),
       last: last,
       candles: candles,
-      ticks: asTicks(data.history),
+      ticks: ticks,
+      quoteAt: quoteAt,
+      receivedAt: Date.now(),
       source: 'pocketoption-demo'
     });
     this.pump();
